@@ -191,7 +191,8 @@ class openstack::controller_ha (
     }
 
     if $queue_provider == 'rabbitmq' {
-      Class['keepalived'] -> Class ['nova::rabbitmq']
+      #Class['keepalived'] -> Class ['nova::rabbitmq']
+      Cs_resource['internal-vip'] -> Class ['nova::rabbitmq']
     }
 
     haproxy_service { 'horizon':    order => 15, port => 80, virtual_ips => [$public_virtual_ip], define_cookies => true  }
@@ -260,6 +261,64 @@ class openstack::controller_ha (
     Exec['wait-for-haproxy-mysql-backend'] -> Service <| title == 'cinder-api' |>
     Anchor['haproxy_done'] -> Exec['wait-for-haproxy-mysql-backend']
     Anchor['haproxy_done'] -> Class['galera']
+    cs_shadow { 'internal-vip': cib => 'internal-vip' }
+
+    cs_resource { 'internal-vip':
+      primitive_class => 'ocf',
+      primitive_type  => 'IPaddr2',
+      provided_by     => 'heartbeat',
+      parameters      => { 'ip' => $internal_virtual_ip, 'cidr_netmask' => '24',
+                           'nic' => $internal_interface },
+      operations      => { 'monitor' => { 'interval' => '15s' } },
+    }
+    
+    cs_commit { 'internal-vip': cib => "internal-vip" }
+
+    cs_shadow { 'public-vip': cib => 'public-vip' }
+
+    cs_resource { 'public-vip':
+      primitive_class => 'ocf',
+      primitive_type  => 'IPaddr2',
+      provided_by     => 'heartbeat',
+      parameters      => { 'ip' => $public_virtual_ip, 'cidr_netmask' => '24',
+                           'nic' => $public_interface },
+      operations      => { 'monitor' => { 'interval' => '15s' } },
+    }
+    
+    cs_commit { 'public-vip': cib => "public-vip" }
+
+    #Order dependencies
+    Cs_resource['internal-vip'] -> Cs_resource['public-vip'] -> Class['openstack::controller']
+    sysctl::value { 'net.ipv4.ip_nonlocal_bind': value => '1' }
+
+    class { 'haproxy':
+      enable => true,
+      global_options   => merge($::haproxy::params::global_options, {'log' => "/dev/log local0"}),
+      defaults_options => merge($::haproxy::params::defaults_options, {'mode' => 'http'}),
+      require => Sysctl::Value['net.ipv4.ip_nonlocal_bind'],
+    }
+
+   if ( $custom_mysql_setup_class == 'galera' ) {
+     Class['haproxy'] -> Class['galera']
+     package { 'socat': ensure => present }
+     exec { 'wait-for-haproxy-mysql-backend':
+       command   => "echo show stat | socat unix-connect:///var/lib/haproxy/stats stdio | grep -q '^mysqld,BACKEND,.*,UP,'",
+       path      => ['/usr/bin', '/usr/sbin', '/sbin', '/bin'],
+       require   => [Service['haproxy'], Package['socat']],
+       try_sleep => 5,
+       tries     => 60,
+     }
+ 
+     Exec<| title == 'wait-for-synced-state' |> -> Exec['wait-for-haproxy-mysql-backend']
+     Exec['wait-for-haproxy-mysql-backend'] -> Exec<| title == 'initial-db-sync' |>
+     Exec['wait-for-haproxy-mysql-backend'] -> Exec<| title == 'keystone-manage db_sync' |>
+     Exec['wait-for-haproxy-mysql-backend'] -> Exec<| title == 'glance-manage db_sync' |>
+     Exec['wait-for-haproxy-mysql-backend'] -> Exec<| title == 'cinder-manage db_sync' |>
+     Exec['wait-for-haproxy-mysql-backend'] -> Exec<| title == 'nova-db-sync' |>
+     Exec['wait-for-haproxy-mysql-backend'] -> Service <| title == 'cinder-scheduler' |>
+     Exec['wait-for-haproxy-mysql-backend'] -> Service <| title == 'cinder-volume' |>
+     Exec['wait-for-haproxy-mysql-backend'] -> Service <| title == 'cinder-api' |>
+   }
 
     class { '::openstack::controller':
       public_address          => $public_virtual_ip,
